@@ -37,7 +37,7 @@ def load_replogle_k562(data_path: str = None, use_pertpy: bool = True) -> ad.Ann
         try:
             import pertpy as pt
             logger.info("Loading K562 dataset via pertpy (will download on first run)...")
-            adata = pt.data.replogle_k562_essential()
+            adata = pt.data.replogle_2022_k562_essential()
             logger.info(f"Loaded {adata.n_obs:,} cells × {adata.n_vars:,} genes via pertpy.")
             return adata
         except Exception as e:
