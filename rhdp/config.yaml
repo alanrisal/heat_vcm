@@ -1,0 +1,27 @@
+data:
+  use_pertpy: true
+  data_path: null          # Set to local .h5ad path if not using pertpy
+  perturbation_key: "gene" # Column in adata.obs that holds perturbation labels
+
+preprocessing:
+  n_top_genes: 5000
+  target_sum: 10000        # Library-size normalization target
+
+programs:
+  n_programs: 50           # K — tune based on verification output
+  max_iter: 1000
+  random_state: 42
+  alpha_H: 0.1             # L2 regularization on H to encourage program sparsity
+
+verification:
+  stability_runs: 5
+  run_enrichment: true
+  enrichment_gene_sets:
+    - "MSigDB_Hallmark_2020"
+    - "KEGG_2021_Human"
+    - "GO_Biological_Process_2023"
+
+output:
+  programs_dir: "outputs/programs"
+  figures_dir: "outputs/programs/figures"
+  logs_dir: "outputs/logs"
