@@ -8,6 +8,7 @@ The output of this module is a clean, HVG-subset, log-normalized AnnData
 of control cells only — the input to NMF in Component 1.
 """
 
+import gc
 import logging
 import anndata as ad
 import numpy as np
@@ -15,6 +16,25 @@ import scanpy as sc
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+# ── RAM Monitoring ────────────────────────────────────────────────────────────
+
+def log_ram_usage(label: str = '') -> float:
+    """
+    Log current process RSS memory usage.
+
+    Uses psutil if available; falls back to a no-op if not installed.
+    Returns usage in GB (0.0 if psutil unavailable).
+    """
+    try:
+        import psutil, os
+        rss_gb = psutil.Process(os.getpid()).memory_info().rss / 1e9
+        tag = f'  [{label}]' if label else ''
+        logger.info(f'RAM usage{tag}: {rss_gb:.2f} GB')
+        return rss_gb
+    except ImportError:
+        return 0.0
 
 
 # ── Data Loading ──────────────────────────────────────────────────────────────
@@ -140,75 +160,121 @@ def preprocess_control_cells(
     target_sum: float = 1e4,
 ) -> ad.AnnData:
     """
-    Standard single-cell preprocessing pipeline for control cells.
+    Memory-efficient preprocessing pipeline for control cells.
 
-    Pipeline:
-        1. Basic QC filtering  — remove very low-quality cells and rarely
-                                 detected genes (conservative thresholds).
-        2. Library-size norm   — equalize sequencing depth across cells.
-        3. Log1p transform     — stabilize variance, compress dynamic range.
-        4. HVG selection       — retain the most informative genes for NMF.
+    Memory design
+    -------------
+    The original ordering (norm → log → store log_norm layer → HVG → subset)
+    kept three full-gene copies of the control matrix alive simultaneously,
+    which causes OOM on datasets with ~600k+ control cells.
 
-    NMF requires non-negative input, which log-normalized data satisfies.
+    The correct ordering is also the memory-efficient one:
+
+        QC filter → HVG selection (raw counts) → subset to HVGs
+        → store counts layer (HVG-size only) → normalize → log1p
+
+    seurat_v3 explicitly requires raw counts for HVG selection, so selecting
+    HVGs before normalization is both statistically correct and avoids ever
+    storing any full-gene layers.
+
+    Side-effect contract
+    --------------------
+    This function does NOT copy ctrl_adata internally. It operates on the
+    object passed in. The caller must:
+        1. Ensure ctrl_adata is already a standalone copy (not an AnnData view).
+        2. `del ctrl_adata; gc.collect()` immediately after this call returns.
+    Both conditions are satisfied by the runner (01_extract_programs.py).
+
+    Layers in the returned AnnData
+    --------------------------------
+        'counts'  — raw UMI counts for the HVG subset (stored before
+                    normalization; useful for any future count-based steps).
+        .X        — log1p-normalized expression for the HVG subset.
+                    This is the matrix NMF receives. No separate log_norm
+                    layer is stored — .X is already the log-normalized data.
 
     Args:
-        ctrl_adata:   AnnData of control cells (raw counts expected).
-        n_top_genes:  Number of highly variable genes to retain for NMF.
-        target_sum:   Library-size normalization target (reads per cell).
+        ctrl_adata:   AnnData of control cells (raw counts in .X).
+                      Modified in-place during QC + HVG steps.
+        n_top_genes:  Number of highly variable genes to retain.
+        target_sum:   Library-size normalization target.
 
     Returns:
-        Preprocessed AnnData, HVG subset, log-normalized.
-        Layers preserved:
-            'counts'   — raw counts (before any transformation)
-            'log_norm' — log-normalized full-gene expression (before HVG subset)
+        New AnnData — HVG subset, log-normalized, with 'counts' layer.
+        The returned object is independent of ctrl_adata (not a view).
     """
-    adata = ctrl_adata.copy()
+    adata = ctrl_adata   # no copy — see docstring
 
-    # Preserve raw counts before any transformation
-    adata.layers['counts'] = adata.X.copy()
-
-    # ── QC filtering ──────────────────────────────────────────────────────────
+    # ── QC filtering (in-place, shrinks the matrix) ───────────────────────────
     n_cells_before = adata.n_obs
     n_genes_before = adata.n_vars
 
-    sc.pp.filter_cells(adata, min_genes=200)   # remove empty/damaged cells
-    sc.pp.filter_genes(adata, min_cells=10)    # remove very rare genes
+    sc.pp.filter_cells(adata, min_genes=200)
+    sc.pp.filter_genes(adata, min_cells=10)
 
     logger.info(
         f"QC filtering: {n_cells_before:,} → {adata.n_obs:,} cells, "
         f"{n_genes_before:,} → {adata.n_vars:,} genes."
     )
 
-    # ── Library-size normalization ────────────────────────────────────────────
-    sc.pp.normalize_total(adata, target_sum=target_sum)
-    logger.info(f"Library-size normalized to {target_sum:.0f} counts per cell.")
+    # ── HVG selection on RAW COUNTS ───────────────────────────────────────────
+    # seurat_v3 requires count-space data. Running this before normalization
+    # is statistically correct AND avoids storing any full-gene normalized copy.
+    # span=1.0 uses a global loess fit (more stable on large, uniform datasets).
+    #
+    # Fallback: if scikit-misc is not installed or the data is too sparse for
+    # the loess fit, we fall back to 'cell_ranger'. A temporary normalized copy
+    # is used only for HVG detection; adata.X (raw counts) is left untouched.
+    try:
+        sc.pp.highly_variable_genes(
+            adata,
+            n_top_genes=n_top_genes,
+            flavor='seurat_v3',
+            span=1.0,
+        )
+        logger.info("HVG selection: used seurat_v3 (count-space).")
+    except (ModuleNotFoundError, ValueError) as e:
+        logger.warning(
+            f"seurat_v3 HVG selection failed ({type(e).__name__}: {e}). "
+            f"Falling back to cell_ranger flavor. "
+            f"Install scikit-misc for seurat_v3: pip install scikit-misc"
+        )
+        _tmp = adata.copy()
+        sc.pp.normalize_total(_tmp, target_sum=target_sum)
+        sc.pp.log1p(_tmp)
+        sc.pp.highly_variable_genes(_tmp, n_top_genes=n_top_genes, flavor='cell_ranger')
+        adata.var['highly_variable'] = _tmp.var['highly_variable'].values
+        del _tmp
+        gc.collect()
+        logger.info("HVG selection: used cell_ranger fallback (log-normalized space).")
 
-    # ── Log1p transformation ──────────────────────────────────────────────────
-    sc.pp.log1p(adata)
-    logger.info("Applied log1p transformation.")
-
-    # Store log-normalized expression over ALL genes before HVG subsetting.
-    # This layer is needed later if we want to decode predictions back to
-    # full gene space using genes outside the HVG set.
-    adata.layers['log_norm'] = adata.X.copy()
-
-    # ── Highly variable gene selection ────────────────────────────────────────
-    # seurat_v3 selects HVGs based on mean-variance trend in count space.
-    # span=1.0 uses a global loess fit (more stable with fewer cells).
-    sc.pp.highly_variable_genes(
-        adata,
-        n_top_genes=n_top_genes,
-        flavor='seurat_v3',
-        span=1.0,
-    )
     n_hvg = adata.var['highly_variable'].sum()
     logger.info(f"Selected {n_hvg:,} highly variable genes (target: {n_top_genes:,}).")
 
-    # Subset to HVGs only — this is the matrix NMF will see
+    # ── Subset to HVGs immediately ────────────────────────────────────────────
+    # Everything from this point forward operates on the HVG-subset matrix.
+    # The .copy() here is the ONLY allocation of a full control-cell matrix
+    # in this function, and it is HVG-sized (n_cells × n_hvg), not full-gene.
     adata = adata[:, adata.var['highly_variable']].copy()
+    gc.collect()
+
+    # ── Store raw counts (HVG subset only, not full-gene) ─────────────────────
+    adata.layers['counts'] = adata.X.copy()
+
+    # ── Library-size normalization (in-place) ─────────────────────────────────
+    sc.pp.normalize_total(adata, target_sum=target_sum)
+    logger.info(f"Library-size normalized to {target_sum:.0f} counts per cell.")
+
+    # ── Log1p transform (in-place) ────────────────────────────────────────────
+    sc.pp.log1p(adata)
+    logger.info("Applied log1p transformation.")
+
+    # .X is now log-normalized — NMF reads it directly from here.
+    # No separate log_norm layer is needed (it would just duplicate .X).
 
     logger.info(
-        f"Preprocessing complete. Final matrix: "
-        f"{adata.n_obs:,} cells × {adata.n_vars:,} HVGs."
+        f"Preprocessing complete. "
+        f"Final matrix: {adata.n_obs:,} cells × {adata.n_vars:,} HVGs. "
+        f"Layers: ['counts']. .X = log-normalized."
     )
     return adata

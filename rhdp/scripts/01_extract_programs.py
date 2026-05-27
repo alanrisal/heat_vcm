@@ -34,6 +34,7 @@ Reading the output:
 """
 
 import argparse
+import gc
 import logging
 import sys
 from pathlib import Path
@@ -47,6 +48,7 @@ from src.data.loader import (
     load_replogle_k562,
     extract_control_cells,
     preprocess_control_cells,
+    log_ram_usage,
 )
 from src.programs.nmf import (
     fit_nmf,
@@ -193,35 +195,69 @@ def main() -> dict:
         data_path=args.data_path,
         use_pertpy=not args.no_pertpy,
     )
+    log_ram_usage('after full dataset load')
 
     # ── Step 2: Isolate control cells ─────────────────────────────────────────
     logger.info('STEP 2 — Extracting control cells')
     ctrl_adata = extract_control_cells(adata)
 
+    # Free the full dataset immediately — it is never needed again.
+    # This is the single largest RAM release in the pipeline (~3-5 GB).
+    del adata
+    gc.collect()
+    log_ram_usage('after del full dataset')
+
     # ── Step 3: Preprocess ────────────────────────────────────────────────────
     logger.info(f'STEP 3 — Preprocessing  (n_hvg={args.n_hvg})')
+    # NOTE: preprocess_control_cells operates on ctrl_adata in-place during
+    # the QC and HVG steps, then returns a new independent HVG-subset object.
+    # We must del ctrl_adata immediately after to release the pre-subset memory.
     ctrl_processed = preprocess_control_cells(ctrl_adata, n_top_genes=args.n_hvg)
+
+    del ctrl_adata
+    gc.collect()
+    log_ram_usage('after del ctrl_adata (pre-subset memory freed)')
 
     gene_names = list(ctrl_processed.var_names)
     cell_barcodes = list(ctrl_processed.obs_names)
 
+    # Densify to float32 for NMF. This is the only dense copy of the data.
+    # After extracting X we free ctrl_processed to avoid holding both the
+    # AnnData and the dense array simultaneously any longer than needed.
     if hasattr(ctrl_processed.X, 'toarray'):
         X = ctrl_processed.X.toarray().astype(np.float32)
     else:
         X = np.array(ctrl_processed.X, dtype=np.float32)
 
+    del ctrl_processed
+    gc.collect()
+    log_ram_usage(f'after densify — working matrix: {X.shape}')
+
     logger.info(f'Expression matrix ready: {X.shape}  (cells × HVGs)')
 
     # ── Step 4: Fit NMF ───────────────────────────────────────────────────────
     logger.info(f'STEP 4 — Fitting NMF  (K={args.k}, alpha_H={args.alpha_h})')
+
+    # We pass X (already dense float32) directly via a lightweight AnnData
+    # wrapper so fit_nmf's interface is unchanged. No second densification occurs
+    # because fit_nmf checks hasattr(.X, 'toarray') — a numpy array has no
+    # toarray(), so it takes the np.array() branch which is a no-op on float32.
+    import anndata as ad
+    adata_for_nmf = ad.AnnData(X=X)
+
     model, W, H = fit_nmf(
-        ctrl_processed,
+        adata_for_nmf,
         n_programs=args.k,
         alpha_H=args.alpha_h,
     )
 
+    del adata_for_nmf
+    gc.collect()
+    log_ram_usage('after NMF fit')
+
     top_genes_df = build_program_dataframe(H, gene_names, n_top=100)
     save_nmf_results(W, H, gene_names, cell_barcodes, str(out_dir))
+    log_ram_usage('after save')
 
     # ── Step 5: Verification checks ───────────────────────────────────────────
     logger.info('STEP 5 — Running verification checks')
