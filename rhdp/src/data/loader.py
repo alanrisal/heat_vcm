@@ -12,10 +12,166 @@ import gc
 import logging
 import anndata as ad
 import numpy as np
+import pandas as pd
 import scanpy as sc
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+# ── Ensembl → HGNC Symbol Conversion ─────────────────────────────────────────
+
+# Candidate column names where the h5ad var dataframe might store HGNC symbols
+_SYMBOL_COLUMN_CANDIDATES = [
+    'gene_name', 'gene_names', 'gene_symbols', 'symbol',
+    'hgnc_symbol', 'name', 'Symbol', 'Gene', 'gene',
+]
+
+
+def _is_ensembl(var_names) -> bool:
+    """Return True if the majority of var_names look like Ensembl gene IDs."""
+    sample = list(var_names[:20])
+    n_ensg = sum(1 for g in sample if str(g).startswith('ENSG'))
+    return n_ensg > len(sample) * 0.5
+
+
+def _find_symbol_column(var_df) -> str | None:
+    """
+    Find which var column contains HGNC gene symbols.
+
+    Checks known candidate column names first, then falls back to detecting
+    any column where most values look like gene symbols (not Ensembl IDs,
+    not chromosomes, not pure numbers).
+    """
+    # Check known candidates first
+    for col in _SYMBOL_COLUMN_CANDIDATES:
+        if col in var_df.columns:
+            sample = var_df[col].dropna().astype(str).iloc[:20]
+            # Must not look like Ensembl IDs or chromosome names
+            n_ensg = sum(1 for v in sample if v.startswith('ENSG'))
+            n_chr  = sum(1 for v in sample if v.startswith('chr'))
+            if n_ensg == 0 and n_chr == 0 and len(sample) > 0:
+                return col
+
+    # Fallback: scan all object/string columns for symbol-like values
+    for col in var_df.columns:
+        if var_df[col].dtype != object:
+            continue
+        sample = var_df[col].dropna().astype(str).iloc[:20]
+        if len(sample) == 0:
+            continue
+        n_ensg  = sum(1 for v in sample if v.startswith('ENSG'))
+        n_chr   = sum(1 for v in sample if v.startswith('chr'))
+        n_alpha = sum(1 for v in sample if v[0].isalpha() and not v.startswith('ENSG'))
+        if n_ensg == 0 and n_chr == 0 and n_alpha > len(sample) * 0.7:
+            return col
+
+    return None
+
+
+def map_ensembl_to_symbols(
+    adata: ad.AnnData,
+    cache_path: str = None,   # kept for API compatibility, no longer used
+) -> ad.AnnData:
+    """
+    Convert Ensembl gene IDs in adata.var_names to HGNC symbols.
+
+    Reads the symbol directly from a column in adata.var — no network call,
+    no external dependency. The symbol column is auto-detected from common
+    names ('gene_name', 'gene_symbols', 'symbol', etc.).
+
+    If the var dataframe contains no symbol column, raises a clear error
+    rather than falling back to the network.
+
+    When two Ensembl IDs share the same HGNC symbol, the gene with higher
+    mean expression is kept and duplicates are dropped.
+
+    Args:
+        adata:      AnnData with Ensembl IDs in var_names.
+        cache_path: Ignored. Kept for backwards compatibility only.
+
+    Returns:
+        AnnData with HGNC symbols as var_names.
+        Returns adata unchanged if var_names are already gene symbols.
+    """
+    if not _is_ensembl(adata.var_names):
+        logger.info("var_names do not look like Ensembl IDs — skipping conversion.")
+        return adata
+
+    logger.info(
+        f"Detected Ensembl IDs in var_names ({adata.n_vars:,} genes). "
+        f"Reading HGNC symbols from var dataframe..."
+    )
+
+    # ── Find the symbol column ────────────────────────────────────────────────
+    sym_col = _find_symbol_column(adata.var)
+
+    if sym_col is None:
+        raise ValueError(
+            "var_names are Ensembl IDs but no HGNC symbol column was found "
+            f"in adata.var.\nAvailable var columns: {list(adata.var.columns)}\n"
+            "Add a 'gene_name' column to adata.var containing HGNC symbols "
+            "and re-run, or use a dataset that includes gene symbols."
+        )
+
+    logger.info(f"  Using var column '{sym_col}' for HGNC symbols.")
+
+    symbols_raw = adata.var[sym_col].astype(str).values   # (n_genes,)
+    n_before    = len(symbols_raw)
+
+    # ── Drop genes with missing or Ensembl-like symbols ──────────────────────
+    valid_mask = np.array([
+        bool(s) and not s.startswith('ENSG') and s != 'nan' and s != ''
+        for s in symbols_raw
+    ])
+    n_invalid = (~valid_mask).sum()
+    if n_invalid > 0:
+        logger.info(
+            f"  Dropping {n_invalid:,} genes with missing or unmapped symbols."
+        )
+
+    # ── Resolve duplicate symbols ─────────────────────────────────────────────
+    # When two Ensembl IDs share a symbol, keep the gene with higher mean
+    # expression. This avoids duplicated var_names and discards the lower-
+    # signal isoform.
+    import scipy.sparse as sp
+
+    X = adata.X
+    if sp.issparse(X):
+        # Compute per-gene means without densifying the full matrix
+        mean_expr = np.asarray(X.mean(axis=0)).ravel()
+    else:
+        mean_expr = np.array(X).mean(axis=0)
+
+    symbol_to_best: dict = {}   # symbol → (gene_index, mean_expr)
+    for idx, (sym, valid, me) in enumerate(zip(symbols_raw, valid_mask, mean_expr)):
+        if not valid:
+            continue
+        if sym not in symbol_to_best or me > symbol_to_best[sym][1]:
+            symbol_to_best[sym] = (idx, me)
+
+    final_indices = sorted(idx for idx, _ in symbol_to_best.values())
+    final_symbols = [symbols_raw[i] for i in final_indices]
+
+    n_dupes   = (n_before - n_invalid) - len(final_indices)
+    n_dropped = n_before - len(final_indices)
+
+    # ── Rebuild AnnData with new var_names ────────────────────────────────────
+    # Subset using boolean index — avoids materialising a dense copy.
+    keep_mask = np.zeros(n_before, dtype=bool)
+    keep_mask[final_indices] = True
+    adata_sub = adata[:, keep_mask].copy()
+
+    # Reassign var_names to HGNC symbols
+    adata_sub.var_names = final_symbols
+    adata_sub.var_names_make_unique()   # safety: should be unique already
+
+    logger.info(
+        f"  Conversion complete: {n_before:,} Ensembl IDs → "
+        f"{len(final_symbols):,} unique HGNC symbols "
+        f"({n_invalid:,} unmapped dropped, {n_dupes:,} duplicates resolved)."
+    )
+    return adata_sub
 
 
 # ── RAM Monitoring ────────────────────────────────────────────────────────────
@@ -39,19 +195,23 @@ def log_ram_usage(label: str = '') -> float:
 
 # ── Data Loading ──────────────────────────────────────────────────────────────
 
-def load_replogle_k562(data_path: str = None, use_pertpy: bool = True) -> ad.AnnData:
+def load_replogle_k562(
+    data_path: str = None,
+    use_pertpy: bool = True,
+) -> ad.AnnData:
     """
     Load the Replogle K562 Perturb-seq dataset.
 
-    Tries pertpy first (downloads automatically on first run, then caches).
-    Falls back to a local .h5ad file if pertpy fails or use_pertpy=False.
+    If var_names are Ensembl IDs (ENSG...), automatically converts them to
+    HGNC symbols by reading the gene symbol column already present in
+    adata.var. No network call or external dependency required.
 
     Args:
         data_path:  Path to a local .h5ad file. Required if use_pertpy=False.
         use_pertpy: Attempt to load via pertpy.
 
     Returns:
-        AnnData with raw counts, all perturbations included.
+        AnnData with HGNC symbols in var_names, all perturbations included.
     """
     if use_pertpy:
         try:
@@ -59,6 +219,7 @@ def load_replogle_k562(data_path: str = None, use_pertpy: bool = True) -> ad.Ann
             logger.info("Loading K562 dataset via pertpy (will download on first run)...")
             adata = pt.data.replogle_2022_k562_essential()
             logger.info(f"Loaded {adata.n_obs:,} cells × {adata.n_vars:,} genes via pertpy.")
+            adata = map_ensembl_to_symbols(adata)
             return adata
         except Exception as e:
             logger.warning(f"pertpy loading failed: {e}. Falling back to local file.")
@@ -78,6 +239,7 @@ def load_replogle_k562(data_path: str = None, use_pertpy: bool = True) -> ad.Ann
     logger.info(f"Loading data from {path}...")
     adata = sc.read_h5ad(str(path))
     logger.info(f"Loaded {adata.n_obs:,} cells × {adata.n_vars:,} genes from disk.")
+    adata = map_ensembl_to_symbols(adata)
     return adata
 
 
@@ -88,6 +250,7 @@ def load_replogle_k562(data_path: str = None, use_pertpy: bool = True) -> ad.Ann
 _CONTROL_LABELS = {
     'control', 'non-targeting', 'ctrl', 'neg_ctrl',
     'CONTROL', 'non_targeting', 'NonTargeting', 'non-targeting_ctrl',
+    'non_targeting', 'safe-targeting',
 }
 
 
@@ -216,6 +379,42 @@ def preprocess_control_cells(
         f"QC filtering: {n_cells_before:,} → {adata.n_obs:,} cells, "
         f"{n_genes_before:,} → {adata.n_vars:,} genes."
     )
+
+    # ── Housekeeping gene exclusion ───────────────────────────────────────────
+    # Mitochondrial (MT-*), ribosomal (RPS*, RPL*), and a handful of
+    # high-expression lncRNAs (MALAT1, NEAT1) dominate raw count variance
+    # but are biologically uninformative for perturbation effects.
+    #
+    # When seurat_v3 selects HVGs from raw counts these go straight to the top
+    # because they are highly expressed and variable — but they covary primarily
+    # with library size and cell-cycle stress, not with gene knockouts. Leaving
+    # them in causes NMF programs to all point in the same diffuse direction
+    # (as seen in the K-sweep: Frobenius error flat at 0.56 across K=50–90,
+    # cosine similarity between programs ~0.4, effective genes 1600–2000).
+    #
+    # This step removes them from the pool BEFORE HVG selection so they cannot
+    # be nominated regardless of how variable they are.
+    excl_prefixes = ('MT-', 'mt-', 'RPS', 'RPL', 'Rps', 'Rpl')
+    excl_exact    = {'MALAT1', 'NEAT1', 'XIST', 'TSIX'}
+
+    keep_mask = np.array([
+        not (g.startswith(excl_prefixes) or g in excl_exact)
+        for g in adata.var_names
+    ])
+    n_excluded = (~keep_mask).sum()
+    if n_excluded > 0:
+        adata = adata[:, keep_mask].copy()
+        gc.collect()
+        logger.info(
+            f"Housekeeping gene exclusion: removed {n_excluded:,} genes "
+            f"(MT-*, RPS*, RPL*, MALAT1, NEAT1, XIST). "
+            f"{adata.n_vars:,} genes remain."
+        )
+    else:
+        logger.info(
+            "Housekeeping gene exclusion: no MT-/ribosomal genes found "
+            "(var_names may already be filtered, or naming convention differs)."
+        )
 
     # ── HVG selection on RAW COUNTS ───────────────────────────────────────────
     # seurat_v3 requires count-space data. Running this before normalization

@@ -112,6 +112,28 @@ def parse_args() -> argparse.Namespace:
              'Increase to encourage sparser programs.'
     )
     p.add_argument(
+        '--tol', type=float, default=1e-3,
+        help='NMF convergence tolerance (default: 1e-3).'
+    )
+    p.add_argument(
+        '--no_gpu', action='store_true',
+        help='Disable GPU acceleration (force CPU). By default GPU is used '
+             'if CUDA is available.'
+    )
+    p.add_argument(
+        '--from_checkpoint', action='store_true',
+        help='Skip data loading and preprocessing entirely. '
+             'Loads the preprocessed X matrix and gene names saved by a '
+             'previous run from --output_dir. Use this when sweeping K values '
+             'to avoid re-running the ~10 min load+preprocess stage each time.'
+    )
+    p.add_argument(
+        '--fast', action='store_true',
+        help='Fast sweep mode: reduces stability_runs to 3 and max_iter to 400. '
+             'Use when exploring K values. Run without --fast for final verification '
+             'on the chosen K. Cuts stability test from ~20 min to ~5 min.'
+    )
+    p.add_argument(
         '--output_dir', type=str, default='outputs/programs',
         help='Directory to save NMF results and figures (default: outputs/programs).'
     )
@@ -124,11 +146,17 @@ def parse_args() -> argparse.Namespace:
 # Each check has a specific corrective action if it fails.
 _CHECKS = [
     {
-        'name': 'Reconstruction (median gene R²)',
-        'get': lambda r, sp, u, st: r['median_gene_r2'],
-        'threshold': 0.3,
-        'direction': 'above',
-        'fix': 'Increase K (more programs can explain more variance).',
+        # Frobenius error is the correct reconstruction check for sparse scRNA-seq.
+        # Median per-gene R² was the original check but is misleading here:
+        # thousands of near-zero-variance genes (dropouts) will always have R²
+        # near 0 because there is nothing for NMF to explain in those genes.
+        # Frobenius error < 0.5 means NMF captures > 50% of total matrix energy,
+        # which is a meaningful signal for this data type.
+        'name': 'Reconstruction (relative Frobenius error)',
+        'get': lambda r, sp, u, st: r['relative_frobenius_error'],
+        'threshold': 0.5,
+        'direction': 'below_or_equal',
+        'fix': 'Increase K (more programs capture more total variance).',
     },
     {
         'name': 'Sparsity (mean Gini coefficient)',
@@ -181,67 +209,99 @@ def evaluate_pass_fail(
 def main() -> dict:
     args = parse_args()
 
+    # ── Apply --fast mode overrides before anything else ──────────────────────
+    # Fast mode cuts the stability test from ~20 min to ~4-5 min.
+    # Use it freely when sweeping K. Run without --fast for the final K choice.
+    if args.fast:
+        stability_runs = 3
+        nmf_max_iter   = 400
+        logger.info('FAST MODE — stability_runs=3, max_iter=400. '
+                    'Good for K sweeps. Re-run without --fast for final verification.')
+    else:
+        stability_runs = args.stability_runs
+        nmf_max_iter   = 1000
+
     out_dir = Path(args.output_dir)
     fig_dir = out_dir / 'figures'
     fig_dir.mkdir(parents=True, exist_ok=True)
 
+    # Paths for the preprocessing checkpoint files
+    checkpoint_X    = out_dir / 'checkpoint_X.npy'
+    checkpoint_genes = out_dir / 'checkpoint_gene_names.txt'
+    checkpoint_cells = out_dir / 'checkpoint_cell_barcodes.txt'
+
     logger.info('=' * 60)
     logger.info(f'  COMPONENT 1: Gene Program Extraction  (K={args.k})')
+    if args.fast:
+        logger.info('  [FAST SWEEP MODE]')
     logger.info('=' * 60)
 
-    # ── Step 1: Load dataset ───────────────────────────────────────────────────
-    logger.info('STEP 1 — Loading dataset')
-    adata = load_replogle_k562(
-        data_path=args.data_path,
-        use_pertpy=not args.no_pertpy,
-    )
-    log_ram_usage('after full dataset load')
+    # ── Steps 1-3: Load + Preprocess (or load from checkpoint) ───────────────
+    if args.from_checkpoint:
+        # ── Checkpoint path: skip ~10 min of loading/preprocessing ──────────
+        if not checkpoint_X.exists():
+            raise FileNotFoundError(
+                f"No checkpoint found at '{checkpoint_X}'.\n"
+                f"Run without --from_checkpoint first to generate it."
+            )
+        logger.info('STEPS 1-3 — Loading from preprocessing checkpoint (skipping data load)...')
+        X          = np.load(str(checkpoint_X))
+        gene_names = checkpoint_genes.read_text().strip().splitlines()
+        cell_barcodes = checkpoint_cells.read_text().strip().splitlines()
+        log_ram_usage(f'checkpoint loaded — X={X.shape}')
+        logger.info(f'Preprocessed matrix loaded: {X.shape}  (cells × HVGs)')
 
-    # ── Step 2: Isolate control cells ─────────────────────────────────────────
-    logger.info('STEP 2 — Extracting control cells')
-    ctrl_adata = extract_control_cells(adata)
-
-    # Free the full dataset immediately — it is never needed again.
-    # This is the single largest RAM release in the pipeline (~3-5 GB).
-    del adata
-    gc.collect()
-    log_ram_usage('after del full dataset')
-
-    # ── Step 3: Preprocess ────────────────────────────────────────────────────
-    logger.info(f'STEP 3 — Preprocessing  (n_hvg={args.n_hvg})')
-    # NOTE: preprocess_control_cells operates on ctrl_adata in-place during
-    # the QC and HVG steps, then returns a new independent HVG-subset object.
-    # We must del ctrl_adata immediately after to release the pre-subset memory.
-    ctrl_processed = preprocess_control_cells(ctrl_adata, n_top_genes=args.n_hvg)
-
-    del ctrl_adata
-    gc.collect()
-    log_ram_usage('after del ctrl_adata (pre-subset memory freed)')
-
-    gene_names = list(ctrl_processed.var_names)
-    cell_barcodes = list(ctrl_processed.obs_names)
-
-    # Densify to float32 for NMF. This is the only dense copy of the data.
-    # After extracting X we free ctrl_processed to avoid holding both the
-    # AnnData and the dense array simultaneously any longer than needed.
-    if hasattr(ctrl_processed.X, 'toarray'):
-        X = ctrl_processed.X.toarray().astype(np.float32)
     else:
-        X = np.array(ctrl_processed.X, dtype=np.float32)
+        # ── Full path: load raw data, preprocess, save checkpoint ────────────
+        logger.info('STEP 1 — Loading dataset')
+        adata = load_replogle_k562(
+            data_path=args.data_path,
+            use_pertpy=not args.no_pertpy,
+        )
+        log_ram_usage('after full dataset load')
 
-    del ctrl_processed
-    gc.collect()
-    log_ram_usage(f'after densify — working matrix: {X.shape}')
+        logger.info('STEP 2 — Extracting control cells')
+        ctrl_adata = extract_control_cells(adata)
+
+        # Free the full dataset immediately — the single largest RAM release.
+        del adata
+        gc.collect()
+        log_ram_usage('after del full dataset')
+
+        logger.info(f'STEP 3 — Preprocessing  (n_hvg={args.n_hvg})')
+        ctrl_processed = preprocess_control_cells(ctrl_adata, n_top_genes=args.n_hvg)
+
+        del ctrl_adata
+        gc.collect()
+        log_ram_usage('after del ctrl_adata')
+
+        gene_names    = list(ctrl_processed.var_names)
+        cell_barcodes = list(ctrl_processed.obs_names)
+
+        if hasattr(ctrl_processed.X, 'toarray'):
+            X = ctrl_processed.X.toarray().astype(np.float32)
+        else:
+            X = np.array(ctrl_processed.X, dtype=np.float32)
+
+        del ctrl_processed
+        gc.collect()
+        log_ram_usage(f'after densify — X={X.shape}')
+
+        # Save checkpoint so future K sweeps skip straight to NMF
+        logger.info(f'Saving preprocessing checkpoint to {out_dir}/ ...')
+        np.save(str(checkpoint_X), X)
+        checkpoint_genes.write_text('\n'.join(gene_names))
+        checkpoint_cells.write_text('\n'.join(cell_barcodes))
+        logger.info('Checkpoint saved. Future runs can use --from_checkpoint to skip preprocessing.')
 
     logger.info(f'Expression matrix ready: {X.shape}  (cells × HVGs)')
 
     # ── Step 4: Fit NMF ───────────────────────────────────────────────────────
-    logger.info(f'STEP 4 — Fitting NMF  (K={args.k}, alpha_H={args.alpha_h})')
+    logger.info(
+        f'STEP 4 — Fitting NMF  '
+        f'(K={args.k}, alpha_H={args.alpha_h}, tol={args.tol}, max_iter={nmf_max_iter})'
+    )
 
-    # We pass X (already dense float32) directly via a lightweight AnnData
-    # wrapper so fit_nmf's interface is unchanged. No second densification occurs
-    # because fit_nmf checks hasattr(.X, 'toarray') — a numpy array has no
-    # toarray(), so it takes the np.array() branch which is a no-op on float32.
     import anndata as ad
     adata_for_nmf = ad.AnnData(X=X)
 
@@ -249,6 +309,9 @@ def main() -> dict:
         adata_for_nmf,
         n_programs=args.k,
         alpha_H=args.alpha_h,
+        tol=args.tol,
+        max_iter=nmf_max_iter,
+        use_gpu=not args.no_gpu,
     )
 
     del adata_for_nmf
@@ -271,9 +334,13 @@ def main() -> dict:
     logger.info('  [3/4] Program uniqueness...')
     uniqueness = compute_program_uniqueness(H)
 
-    logger.info(f'  [4/4] NMF stability ({args.stability_runs} runs)...')
+    logger.info(f'  [4/4] NMF stability ({stability_runs} runs, max_iter={nmf_max_iter})...')
     stability = test_nmf_stability(
-        X, args.k, n_runs=args.stability_runs, max_iter=500
+        X, args.k,
+        n_runs=stability_runs,
+        max_iter=nmf_max_iter,
+        tol=args.tol,
+        use_gpu=not args.no_gpu,
     )
 
     # ── Step 6: Pathway enrichment (optional) ─────────────────────────────────
@@ -316,18 +383,23 @@ def main() -> dict:
             )
             logger.warning(f"        → Fix: {f['fix']}")
         logger.warning('')
-        logger.warning(
-            'Adjust K or alpha_H and re-run this script until all checks pass.'
-        )
+        if args.fast:
+            logger.warning('Note: running in --fast mode. Re-run without --fast '
+                           'before treating any result as final.')
+        logger.warning('Adjust K or alpha_H and re-run with --from_checkpoint --fast '
+                       'to skip preprocessing on future attempts.')
     else:
         logger.info('')
         logger.info('✓  ALL CHECKS PASSED.')
+        if args.fast:
+            logger.info('  Note: --fast mode was active. '
+                        'Re-run without --fast to confirm with full stability settings.')
         logger.info(f'   K={args.k} gene programs are ready for Component 2.')
         logger.info(f'   Results saved to: {out_dir}/')
         logger.info('')
 
     return {
-        'adata': ctrl_processed,
+        'X': X,
         'W': W,
         'H': H,
         'gene_names': gene_names,

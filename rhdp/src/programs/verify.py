@@ -36,7 +36,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-from sklearn.decomposition import NMF
 from sklearn.metrics.pairwise import cosine_similarity
 
 logger = logging.getLogger(__name__)
@@ -186,46 +185,53 @@ def test_nmf_stability(
     X: np.ndarray,
     n_programs: int,
     n_runs: int = 5,
-    max_iter: int = 500,
+    max_iter: int = 1000,
+    tol: float = 1e-3,
+    use_gpu: bool = True,
 ) -> dict:
     """
     Test whether NMF produces consistent programs across independent random seeds.
 
+    Calls fit_nmf() directly so stability runs benefit from GPU acceleration.
+
     Strategy:
-        Run NMF n_runs times with different seeds (using nndsvda init, which is
-        deterministic for the seed but solver randomness still exists).
-        For each pair of runs, greedily match programs by maximum cosine
-        similarity. The mean matched similarity is the stability score.
+        Run NMF n_runs times with different seeds. For each pair of runs,
+        greedily match programs by maximum cosine similarity. The mean matched
+        similarity is the stability score.
 
     Thresholds:
-        > 0.85  — stable. Programs are a genuine feature of the data.
-        0.75–0.85 — acceptable. Minor variation but core programs are consistent.
-        < 0.75  — unstable. K is likely too large, or data is too noisy for
-                  clean decomposition at this K. Reduce K and retest.
+        > 0.85  — stable.
+        0.75–0.85 — acceptable.
+        < 0.75  — unstable. Reduce K and retest.
 
     Args:
         X:          Expression matrix (n_cells, n_genes).
         n_programs: K to test.
         n_runs:     Number of independent NMF fits.
-        max_iter:   NMF iterations per run (lower is fine here — just for stability test).
+        max_iter:   Should match the main fit's max_iter.
+        tol:        Should match the main fit's tol.
+        use_gpu:    Passed through to fit_nmf.
 
     Returns:
         Dict with mean_stability_score, pairwise_scores, interpretation.
     """
+    # Import here to avoid circular dependency at module level
+    from src.programs.nmf import fit_nmf
+
     logger.info(f"Running NMF {n_runs}× with K={n_programs} to assess stability...")
 
     H_runs = []
     for i in range(n_runs):
-        m = NMF(
-            n_components=n_programs,
-            init='nndsvda',
-            solver='cd',
+        _, _, H_i = fit_nmf(
+            # Wrap X in a minimal AnnData so fit_nmf's interface is unchanged
+            __import__('anndata').AnnData(X=X),
+            n_programs=n_programs,
+            random_state=i * 137,
             max_iter=max_iter,
-            random_state=i * 137,  # well-separated seeds
-            tol=1e-4,
+            tol=tol,
+            use_gpu=use_gpu,
         )
-        m.fit(X)
-        H_runs.append(m.components_)
+        H_runs.append(H_i)
 
     pairwise_scores = []
     for i in range(n_runs):
@@ -328,7 +334,7 @@ def run_pathway_enrichment(
             enr = gp.enrichr(
                 gene_list=gene_list,
                 gene_sets=gene_sets,
-                organism='Human',
+                organism='human',
                 outdir=None,
                 verbose=False,
             )
